@@ -1,176 +1,342 @@
 /**
  * API Route: /api/analyze
- * 
- * Combined endpoint that:
- * 1. Fetches all real data from /api/liquidity, /api/market, /api/solar
- * 2. Runs CSD (Critical Slowing Down) analysis
- * 3. Runs LPPL (Log-Periodic Power Law) bubble detection
- * 4. Returns unified dataset with analysis results
- * 
- * All data is sourced from official government APIs and is fully auditable.
+ * Fetches all data and runs CSD/LPPL analysis
+ * Calls external APIs directly (not internal routes)
  */
 
-import { analyzeCSD } from '../../lib/statistical-engine';
-import { optimizeLPPL } from '../../lib/lppl-model';
+// ============ STATISTICAL ENGINE ============
+class StatisticalEngine {
+  static gaussianKernel(x, bandwidth) {
+    return Math.exp(-0.5 * Math.pow(x / bandwidth, 2)) / (bandwidth * Math.sqrt(2 * Math.PI));
+  }
 
-let cache = {
-  data: null,
-  timestamp: 0
-};
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes (analysis is expensive)
+  static detrend(data, bandwidth = 50) {
+    const n = data.length;
+    const trend = [];
+    const residuals = [];
+    
+    for (let i = 0; i < n; i++) {
+      let weightSum = 0;
+      let valueSum = 0;
+      for (let j = 0; j < n; j++) {
+        const weight = this.gaussianKernel(i - j, bandwidth);
+        weightSum += weight;
+        valueSum += weight * data[j];
+      }
+      trend[i] = valueSum / weightSum;
+      residuals[i] = data[i] - trend[i];
+    }
+    return { trend, residuals };
+  }
 
+  static rollingAR1(residuals, windowSize = 250) {
+    const n = residuals.length;
+    const ar1 = [];
+    
+    for (let i = 0; i < n; i++) {
+      if (i < windowSize + 1) { ar1[i] = null; continue; }
+      
+      const currentWindow = [];
+      const lagWindow = [];
+      
+      for (let j = 0; j < windowSize; j++) {
+        currentWindow.push(residuals[i - windowSize + j]);
+        lagWindow.push(residuals[i - windowSize + j - 1]);
+      }
+      
+      const meanCurrent = currentWindow.reduce((a, b) => a + b, 0) / windowSize;
+      const meanLag = lagWindow.reduce((a, b) => a + b, 0) / windowSize;
+      
+      let cov = 0, varCurrent = 0, varLag = 0;
+      for (let j = 0; j < windowSize; j++) {
+        const dCurrent = currentWindow[j] - meanCurrent;
+        const dLag = lagWindow[j] - meanLag;
+        cov += dCurrent * dLag;
+        varCurrent += dCurrent * dCurrent;
+        varLag += dLag * dLag;
+      }
+      
+      const correlation = (varCurrent > 0 && varLag > 0) ? cov / Math.sqrt(varCurrent * varLag) : 0;
+      ar1[i] = Math.max(-1, Math.min(1, correlation));
+    }
+    return ar1;
+  }
+
+  static rollingVariance(residuals, windowSize = 250) {
+    const n = residuals.length;
+    const variance = [];
+    for (let i = 0; i < n; i++) {
+      if (i < windowSize) { variance[i] = null; continue; }
+      const window = residuals.slice(i - windowSize, i);
+      const mean = window.reduce((a, b) => a + b, 0) / windowSize;
+      const sumSq = window.reduce((sum, val) => sum + Math.pow(val - mean, 2), 0);
+      variance[i] = sumSq / (windowSize - 1);
+    }
+    return variance;
+  }
+
+  static kendallTau(ar1Series, lookback = 100) {
+    const validAr1 = ar1Series.filter(v => v !== null);
+    const recent = validAr1.slice(-lookback);
+    if (recent.length < 10) return 0;
+    
+    let concordant = 0, discordant = 0;
+    for (let i = 0; i < recent.length - 1; i++) {
+      for (let j = i + 1; j < recent.length; j++) {
+        const xDiff = j - i;
+        const yDiff = recent[j] - recent[i];
+        if (xDiff * yDiff > 0) concordant++;
+        else if (xDiff * yDiff < 0) discordant++;
+      }
+    }
+    const pairs = (recent.length * (recent.length - 1)) / 2;
+    return pairs > 0 ? (concordant - discordant) / pairs : 0;
+  }
+}
+
+// ============ LPPL MODEL ============
+class LPPLModel {
+  static lpplFunction(t, tc, A, B, C, m, omega, phi) {
+    const dt = tc - t;
+    if (dt <= 0) return A;
+    const dtm = Math.pow(dt, m);
+    return A + B * dtm + C * dtm * Math.cos(omega * Math.log(dt) + phi);
+  }
+
+  static optimize(prices) {
+    const n = prices.length;
+    if (n < 100) return { isBubble: false, confidence: 0, r2: 0 };
+    
+    const logPrices = prices.map(p => Math.log(p));
+    const t = Array.from({ length: n }, (_, i) => i);
+    
+    let bestFit = null;
+    let bestR2 = -Infinity;
+    
+    const tcRange = [];
+    for (let tc = n + 5; tc <= n + 200; tc += 15) tcRange.push(tc);
+    
+    for (const tc of tcRange) {
+      for (const m of [0.2, 0.33, 0.5, 0.67, 0.8]) {
+        for (const omega of [6, 8, 10, 12]) {
+          for (const phi of [0, Math.PI/2, Math.PI, 3*Math.PI/2]) {
+            const X = [], y = [];
+            let valid = true;
+            
+            for (let i = 0; i < n; i++) {
+              const dt = tc - t[i];
+              if (dt <= 0) { valid = false; break; }
+              const dtm = Math.pow(dt, m);
+              X.push([1, dtm, dtm * Math.cos(omega * Math.log(dt) + phi)]);
+              y.push(logPrices[i]);
+            }
+            if (!valid) continue;
+            
+            const coeffs = this.solveOLS(X, y);
+            if (!coeffs) continue;
+            const [A, B, C] = coeffs;
+            
+            if (B >= 0 || Math.abs(C) > Math.abs(B)) continue;
+            
+            const predicted = t.map(ti => this.lpplFunction(ti, tc, A, B, C, m, omega, phi));
+            const ssRes = logPrices.reduce((sum, yi, i) => sum + Math.pow(yi - predicted[i], 2), 0);
+            const meanY = logPrices.reduce((a, b) => a + b, 0) / n;
+            const ssTot = logPrices.reduce((sum, yi) => sum + Math.pow(yi - meanY, 2), 0);
+            const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
+            
+            if (r2 > bestR2 && r2 > 0.75) {
+              bestR2 = r2;
+              bestFit = { tc, A, B, C, m, omega, phi, r2 };
+            }
+          }
+        }
+      }
+    }
+    
+    if (!bestFit || bestFit.r2 < 0.75) {
+      return { isBubble: false, confidence: 0, r2: bestFit?.r2 || 0, tcDays: null };
+    }
+    
+    const confidence = Math.min(1, Math.max(0, (bestFit.r2 - 0.75) / 0.2));
+    const tcDays = Math.round(bestFit.tc - n + 1);
+    
+    return {
+      ...bestFit,
+      confidence,
+      tcDays,
+      isBubble: confidence > 0.3 && tcDays > 5 && tcDays < 200
+    };
+  }
+
+  static solveOLS(X, y) {
+    const n = X.length, p = 3;
+    const XtX = [[0,0,0],[0,0,0],[0,0,0]];
+    const Xty = [0,0,0];
+    
+    for (let i = 0; i < p; i++) {
+      for (let j = 0; j < p; j++) {
+        for (let k = 0; k < n; k++) XtX[i][j] += X[k][i] * X[k][j];
+      }
+      for (let k = 0; k < n; k++) Xty[i] += X[k][i] * y[k];
+    }
+    
+    const A = XtX;
+    const det = A[0][0]*(A[1][1]*A[2][2]-A[1][2]*A[2][1]) - A[0][1]*(A[1][0]*A[2][2]-A[1][2]*A[2][0]) + A[0][2]*(A[1][0]*A[2][1]-A[1][1]*A[2][0]);
+    if (Math.abs(det) < 1e-10) return null;
+    
+    const inv = 1/det;
+    const adj = [
+      [(A[1][1]*A[2][2]-A[1][2]*A[2][1])*inv, (A[0][2]*A[2][1]-A[0][1]*A[2][2])*inv, (A[0][1]*A[1][2]-A[0][2]*A[1][1])*inv],
+      [(A[1][2]*A[2][0]-A[1][0]*A[2][2])*inv, (A[0][0]*A[2][2]-A[0][2]*A[2][0])*inv, (A[0][2]*A[1][0]-A[0][0]*A[1][2])*inv],
+      [(A[1][0]*A[2][1]-A[1][1]*A[2][0])*inv, (A[0][1]*A[2][0]-A[0][0]*A[2][1])*inv, (A[0][0]*A[1][1]-A[0][1]*A[1][0])*inv]
+    ];
+    
+    return [
+      adj[0][0]*Xty[0] + adj[0][1]*Xty[1] + adj[0][2]*Xty[2],
+      adj[1][0]*Xty[0] + adj[1][1]*Xty[1] + adj[1][2]*Xty[2],
+      adj[2][0]*Xty[0] + adj[2][1]*Xty[1] + adj[2][2]*Xty[2]
+    ];
+  }
+}
+
+// ============ MAIN HANDLER ============
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET');
 
-  // Parse config from query params
   const config = {
     detrendBandwidth: parseInt(req.query.detrendBandwidth) || 50,
     csdWindow: parseInt(req.query.csdWindow) || 250,
     tauLookback: parseInt(req.query.tauLookback) || 100
   };
 
-  // Create cache key based on config
-  const cacheKey = JSON.stringify(config);
-  
-  if (cache.data && cache.key === cacheKey && Date.now() - cache.timestamp < CACHE_TTL) {
-    return res.status(200).json({
-      ...cache.data,
-      cached: true,
-      cacheAge: Math.round((Date.now() - cache.timestamp) / 1000)
-    });
+  const FRED_API_KEY = process.env.FRED_API_KEY;
+  if (!FRED_API_KEY) {
+    return res.status(500).json({ error: 'FRED_API_KEY not configured' });
   }
 
   try {
-    // Get base URL for internal API calls
-    const protocol = req.headers['x-forwarded-proto'] || 'http';
-    const host = req.headers.host;
-    const baseUrl = `${protocol}://${host}`;
+    const endDate = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
-    // Fetch all data sources in parallel
-    const [liquidityRes, marketRes, solarRes] = await Promise.all([
-      fetch(`${baseUrl}/api/liquidity`),
-      fetch(`${baseUrl}/api/market`),
-      fetch(`${baseUrl}/api/solar`)
+    // Fetch ALL data directly from external APIs
+    const [walclRes, rrpRes, wresbalRes, wtregenRes, sp500Res, solarRes] = await Promise.all([
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WALCL&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=RRPONTSYD&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WRESBAL&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WTREGEN&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=SP500&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch('https://services.swpc.noaa.gov/json/solar-cycle/observed-solar-cycle-indices.json')
     ]);
 
-    const [liquidityData, marketData, solarData] = await Promise.all([
-      liquidityRes.json(),
-      marketRes.json(),
+    const [walcl, rrp, wresbal, wtregen, sp500, solar] = await Promise.all([
+      walclRes.json(),
+      rrpRes.json(),
+      wresbalRes.json(),
+      wtregenRes.json(),
+      sp500Res.json(),
       solarRes.json()
     ]);
 
-    // Check for errors
-    if (liquidityData.error) {
-      return res.status(500).json({ 
-        error: 'Failed to fetch liquidity data', 
-        details: liquidityData 
-      });
-    }
-    if (marketData.error) {
-      return res.status(500).json({ 
-        error: 'Failed to fetch market data', 
-        details: marketData 
-      });
-    }
+    if (walcl.error_message) throw new Error(`FRED: ${walcl.error_message}`);
 
-    // Build unified time series by date
-    const liquidityMap = {};
-    (liquidityData.timeSeries || []).forEach(d => {
-      liquidityMap[d.date] = d;
-    });
+    // Build lookup maps
+    const toMap = (obs, divisor = 1) => {
+      const map = {};
+      (obs || []).forEach(o => { if (o.value !== '.') map[o.date] = parseFloat(o.value) / divisor; });
+      return map;
+    };
 
-    const marketMap = {};
-    (marketData.timeSeries || []).forEach(d => {
-      marketMap[d.date] = d;
-    });
+    const bsMap = toMap(walcl.observations, 1000);
+    const rrpMap = toMap(rrp.observations, 1);
+    const resMap = toMap(wresbal.observations, 1000);
+    const tgaMap = toMap(wtregen.observations, 1000);
+    const spxMap = toMap(sp500.observations, 1);
 
     const solarMap = {};
-    (solarData.timeSeries || []).forEach(d => {
-      solarMap[d.date] = d;
+    (solar || []).forEach(s => {
+      if (s['time-tag'] && s.ssn != null) {
+        solarMap[s['time-tag'].split('T')[0]] = Math.round(s.ssn);
+      }
     });
 
-    // Get all unique dates and sort
-    const allDates = [...new Set([
-      ...Object.keys(liquidityMap),
-      ...Object.keys(marketMap)
-    ])].sort();
+    // Get dates where we have S&P data (most granular)
+    const allDates = Object.keys(spxMap).sort();
 
-    // Build unified dataset (only dates with both liquidity AND market data)
-    const unifiedData = allDates
-      .filter(date => liquidityMap[date] && marketMap[date])
-      .map(date => {
-        const liq = liquidityMap[date] || {};
-        const mkt = marketMap[date] || {};
-        const sol = solarMap[date] || {};
-        
-        return {
-          date,
-          balanceSheet: liq.balanceSheet,
-          tga: liq.tga,
-          rrp: liq.rrp,
-          reserves: liq.reserves,
-          netLiquidity: liq.netLiquidity,
-          spx: mkt.close,
-          sunspots: sol.sunspots || null
-        };
-      })
-      .filter(d => d.spx !== undefined && d.netLiquidity !== undefined);
+    // Forward fill weekly data
+    const ffill = (map, dates) => {
+      const out = {};
+      let last = null;
+      dates.forEach(d => { if (map[d] !== undefined) last = map[d]; if (last !== null) out[d] = last; });
+      return out;
+    };
 
-    if (unifiedData.length < 100) {
-      return res.status(400).json({
-        error: 'Insufficient data for analysis',
-        message: `Need at least 100 data points, got ${unifiedData.length}`,
-        suggestion: 'Check that FRED_API_KEY is configured correctly'
-      });
+    const fBS = ffill(bsMap, allDates);
+    const fTGA = ffill(tgaMap, allDates);
+    const fRRP = ffill(rrpMap, allDates);
+    const fRes = ffill(resMap, allDates);
+
+    // Build unified time series
+    const timeSeries = allDates
+      .filter(d => fBS[d] && fTGA[d] && fRRP[d] && spxMap[d])
+      .map(d => ({
+        date: d,
+        balanceSheet: Math.round(fBS[d] * 10) / 10,
+        tga: Math.round(fTGA[d] * 10) / 10,
+        rrp: Math.round(fRRP[d] * 10) / 10,
+        reserves: fRes[d] ? Math.round(fRes[d] * 10) / 10 : null,
+        netLiquidity: Math.round((fBS[d] - fTGA[d] - fRRP[d]) * 10) / 10,
+        spx: Math.round(spxMap[d] * 100) / 100,
+        sunspots: solarMap[d] || null
+      }));
+
+    if (timeSeries.length < 100) {
+      return res.status(400).json({ error: 'Insufficient data', count: timeSeries.length });
     }
 
-    // Extract price series for analysis
-    const prices = unifiedData.map(d => d.spx);
-    const dates = unifiedData.map(d => d.date);
-
     // Run CSD analysis
-    const csdResult = analyzeCSD(prices, config);
+    const prices = timeSeries.map(d => d.spx);
+    const { trend, residuals } = StatisticalEngine.detrend(prices, config.detrendBandwidth);
+    const ar1Series = StatisticalEngine.rollingAR1(residuals, config.csdWindow);
+    const varianceSeries = StatisticalEngine.rollingVariance(residuals, config.csdWindow);
+    const kendallTau = StatisticalEngine.kendallTau(ar1Series, config.tauLookback);
+    
+    const validAr1 = ar1Series.filter(v => v !== null);
+    const currentAR1 = validAr1.length > 0 ? validAr1[validAr1.length - 1] : 0;
 
-    // Run LPPL analysis
-    const lpplResult = optimizeLPPL(prices, dates);
+    let csdStatus = 'NORMAL';
+    if (currentAR1 > 0.8) csdStatus = 'CRITICAL';
+    else if (currentAR1 > 0.7) csdStatus = 'ELEVATED';
+    else if (currentAR1 > 0.6) csdStatus = 'RISING';
 
-    // Merge analysis results into time series
-    const analyzedData = unifiedData.map((d, i) => ({
+    // Run LPPL
+    const lpplResult = LPPLModel.optimize(prices);
+
+    // Add analysis to time series
+    const analyzed = timeSeries.map((d, i) => ({
       ...d,
-      trend: csdResult.trend[i] ? Math.round(csdResult.trend[i] * 100) / 100 : null,
-      residual: csdResult.residuals[i] ? Math.round(csdResult.residuals[i] * 100) / 100 : null,
-      ar1: csdResult.ar1Series[i] !== null ? Math.round(csdResult.ar1Series[i] * 1000) / 1000 : null,
-      variance: csdResult.varianceSeries[i] !== null ? Math.round(csdResult.varianceSeries[i] * 100) / 100 : null
+      trend: trend[i] ? Math.round(trend[i] * 100) / 100 : null,
+      ar1: ar1Series[i] !== null ? Math.round(ar1Series[i] * 1000) / 1000 : null,
+      variance: varianceSeries[i] !== null ? Math.round(varianceSeries[i] * 100) / 100 : null
     }));
 
-    // Build response with full provenance
-    const result = {
+    return res.status(200).json({
       success: true,
       timestamp: new Date().toISOString(),
       config,
       sources: {
-        liquidity: liquidityData.sources,
-        market: marketData.source,
-        solar: solarData.source
+        liquidity: {
+          balanceSheet: { name: 'WALCL', url: 'https://fred.stlouisfed.org/series/WALCL', frequency: 'Weekly' },
+          tga: { name: 'WTREGEN', url: 'https://fred.stlouisfed.org/series/WTREGEN', frequency: 'Weekly' },
+          rrp: { name: 'RRPONTSYD', url: 'https://fred.stlouisfed.org/series/RRPONTSYD', frequency: 'Daily' },
+          reserves: { name: 'WRESBAL', url: 'https://fred.stlouisfed.org/series/WRESBAL', frequency: 'Weekly' }
+        },
+        market: { name: 'SP500', url: 'https://fred.stlouisfed.org/series/SP500', frequency: 'Daily' },
+        solar: { name: 'NOAA SWPC', url: 'https://www.swpc.noaa.gov/products/solar-cycle-progression', frequency: 'Daily' }
       },
       csd: {
-        currentAR1: Math.round(csdResult.currentAR1 * 1000) / 1000,
-        kendallTau: Math.round(csdResult.kendallTau * 1000) / 1000,
-        status: csdResult.status,
-        currentVariance: Math.round(csdResult.currentVariance * 100) / 100,
-        interpretation: {
-          ar1: csdResult.currentAR1 > 0.7 
-            ? 'System showing signs of critical slowing down' 
-            : csdResult.currentAR1 > 0.5 
-              ? 'Elevated autocorrelation, monitor closely'
-              : 'Normal resilience',
-          tau: csdResult.kendallTau > 0.3 
-            ? 'AR(1) trending upward - warning signal'
-            : csdResult.kendallTau < -0.3
-              ? 'AR(1) trending downward - recovering'
-              : 'No significant trend in AR(1)'
-        }
+        currentAR1: Math.round(currentAR1 * 1000) / 1000,
+        kendallTau: Math.round(kendallTau * 1000) / 1000,
+        status: csdStatus
       },
       lppl: {
         isBubble: lpplResult.isBubble,
@@ -178,35 +344,18 @@ export default async function handler(req, res) {
         tcDays: lpplResult.tcDays,
         r2: lpplResult.r2 ? Math.round(lpplResult.r2 * 1000) / 1000 : null,
         omega: lpplResult.omega ? Math.round(lpplResult.omega * 100) / 100 : null,
-        m: lpplResult.m ? Math.round(lpplResult.m * 100) / 100 : null,
         interpretation: lpplResult.isBubble
-          ? `LPPL bubble signature detected. Estimated ${lpplResult.tcDays} days to critical time.`
-          : 'No significant LPPL bubble signature detected.'
+          ? `Bubble signature detected. ~${lpplResult.tcDays} days to critical time.`
+          : 'No LPPL bubble signature detected.'
       },
-      latest: analyzedData[analyzedData.length - 1],
-      timeSeries: analyzedData,
-      recordCount: analyzedData.length,
-      dateRange: {
-        start: analyzedData[0]?.date,
-        end: analyzedData[analyzedData.length - 1]?.date
-      }
-    };
-
-    // Update cache
-    cache = {
-      data: result,
-      key: cacheKey,
-      timestamp: Date.now()
-    };
-
-    return res.status(200).json(result);
+      latest: analyzed[analyzed.length - 1],
+      timeSeries: analyzed,
+      recordCount: analyzed.length,
+      dateRange: { start: analyzed[0]?.date, end: analyzed[analyzed.length - 1]?.date }
+    });
 
   } catch (error) {
     console.error('Analysis API Error:', error);
-    return res.status(500).json({
-      error: 'Analysis failed',
-      message: error.message,
-      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
-    });
+    return res.status(500).json({ error: 'Analysis failed', message: error.message });
   }
 }
