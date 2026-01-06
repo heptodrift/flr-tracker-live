@@ -1,17 +1,6 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, ComposedChart, ReferenceLine, ReferenceArea } from 'recharts';
-import { Activity, Sun, DollarSign, Shield, Database, AlertCircle, Layers, X, HelpCircle, RefreshCw, Sliders, ExternalLink, CheckCircle2, AlertTriangle, TrendingUp } from 'lucide-react';
-
-/**
- * FLR Tracker - Live Version with Real Data
- * 
- * All data sourced from:
- * - Federal Reserve Bank of St. Louis (FRED)
- * - U.S. Department of Treasury Fiscal Data
- * - NOAA Space Weather Prediction Center
- * 
- * Every data point is verifiable at the source URLs provided.
- */
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area, ComposedChart, ReferenceLine, ReferenceArea, Brush } from 'recharts';
+import { Activity, Sun, DollarSign, Shield, Database, AlertCircle, Layers, X, HelpCircle, RefreshCw, Sliders, ExternalLink, CheckCircle2, TrendingUp, ZoomIn } from 'lucide-react';
 
 const FLRTrackerLive = () => {
   const [data, setData] = useState(null);
@@ -27,6 +16,10 @@ const FLRTrackerLive = () => {
   const [showHelp, setShowHelp] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showSources, setShowSources] = useState(false);
+  
+  // TIME RANGE STATE
+  const [timeRange, setTimeRange] = useState('1Y'); // 1M, 3M, 6M, 1Y, 2Y, 5Y, ALL
+  const [brushIndex, setBrushIndex] = useState({ start: null, end: null });
 
   const loadData = useCallback(async () => {
     setLoading(true);
@@ -61,39 +54,50 @@ const FLRTrackerLive = () => {
     loadData();
   }, [loadData]);
 
+  // FILTER DATA BY TIME RANGE
+  const filteredData = useMemo(() => {
+    if (!data?.timeSeries) return [];
+    
+    const ts = data.timeSeries;
+    const now = new Date(ts[ts.length - 1]?.date);
+    
+    let daysBack;
+    switch (timeRange) {
+      case '1M': daysBack = 30; break;
+      case '3M': daysBack = 90; break;
+      case '6M': daysBack = 180; break;
+      case '1Y': daysBack = 365; break;
+      case '2Y': daysBack = 730; break;
+      case '5Y': daysBack = 1825; break;
+      case 'ALL': default: daysBack = 99999; break;
+    }
+    
+    const cutoff = new Date(now);
+    cutoff.setDate(cutoff.getDate() - daysBack);
+    const cutoffStr = cutoff.toISOString().split('T')[0];
+    
+    return ts.filter(d => d.date >= cutoffStr);
+  }, [data, timeRange]);
+
   // Calculate regime score
   const regime = useMemo(() => {
     if (!data) return null;
     
     const { csd, lppl, latest } = data;
     
-    // AR1 score (0-100): 0.3 baseline, 0.8 critical
     const ar1Score = Math.min(100, Math.max(0, (csd.currentAR1 - 0.3) / 0.5 * 100));
-    
-    // Tau score: positive trend = rising risk
     const tauScore = Math.min(100, Math.max(0, (csd.kendallTau + 0.5) / 1 * 100));
-    
-    // LPPL score
     const lpplScore = lppl.isBubble ? lppl.confidence : 0;
-    
-    // Liquidity score: low = high risk (scale: 4500-6500B)
     const liquidityScore = Math.min(100, Math.max(0, (6500 - latest.netLiquidity) / 20));
     
-    // Weighted composite
     const composite = ar1Score * 0.35 + tauScore * 0.2 + lpplScore * 0.25 + liquidityScore * 0.2;
     
     let status, color, signal;
-    if (composite > 70) {
-      status = 'CRITICAL'; color = 'rose'; signal = 'STRONG SELL';
-    } else if (composite > 55) {
-      status = 'ELEVATED'; color = 'amber'; signal = 'REDUCE RISK';
-    } else if (composite > 40) {
-      status = 'CAUTION'; color = 'yellow'; signal = 'HOLD';
-    } else if (composite > 25) {
-      status = 'NORMAL'; color = 'emerald'; signal = 'ACCUMULATE';
-    } else {
-      status = 'FAVORABLE'; color = 'cyan'; signal = 'STRONG BUY';
-    }
+    if (composite > 70) { status = 'CRITICAL'; color = 'rose'; signal = 'STRONG SELL'; }
+    else if (composite > 55) { status = 'ELEVATED'; color = 'amber'; signal = 'REDUCE RISK'; }
+    else if (composite > 40) { status = 'CAUTION'; color = 'yellow'; signal = 'HOLD'; }
+    else if (composite > 25) { status = 'NORMAL'; color = 'emerald'; signal = 'ACCUMULATE'; }
+    else { status = 'FAVORABLE'; color = 'cyan'; signal = 'STRONG BUY'; }
     
     return { composite, status, color, signal, ar1Score, tauScore, lpplScore, liquidityScore };
   }, [data]);
@@ -125,6 +129,25 @@ const FLRTrackerLive = () => {
     cyan: { bg: 'from-cyan-950/50 to-cyan-900/30', border: 'border-cyan-800', text: 'text-cyan-400', textLight: 'text-cyan-300' }
   }[color]);
 
+  // TIME RANGE BUTTONS
+  const TimeRangeSelector = () => (
+    <div className="flex items-center gap-1 bg-slate-800/50 rounded-lg p-1">
+      {['1M', '3M', '6M', '1Y', '2Y', '5Y', 'ALL'].map(range => (
+        <button
+          key={range}
+          onClick={() => setTimeRange(range)}
+          className={`px-2 py-1 text-xs font-mono rounded transition-colors ${
+            timeRange === range
+              ? 'bg-cyan-600 text-white'
+              : 'text-slate-400 hover:text-white hover:bg-slate-700'
+          }`}
+        >
+          {range}
+        </button>
+      ))}
+    </div>
+  );
+
   if (loading) {
     return (
       <div className="min-h-screen bg-black flex items-center justify-center">
@@ -136,7 +159,7 @@ const FLRTrackerLive = () => {
             <Activity className="absolute inset-0 m-auto w-8 h-8 text-cyan-400" />
           </div>
           <p className="text-cyan-400 font-mono text-sm tracking-wider">FETCHING LIVE DATA</p>
-          <p className="text-slate-600 font-mono text-xs mt-2">Connecting to FRED, Treasury, NOAA...</p>
+          <p className="text-slate-600 font-mono text-xs mt-2">Loading 10 years of history...</p>
         </div>
       </div>
     );
@@ -149,20 +172,7 @@ const FLRTrackerLive = () => {
           <AlertCircle className="w-12 h-12 text-rose-400 mx-auto mb-4" />
           <h2 className="text-rose-400 font-mono text-center text-lg mb-2">Data Fetch Error</h2>
           <p className="text-slate-400 text-sm text-center mb-4">{error}</p>
-          
-          <div className="bg-slate-900/50 rounded-lg p-4 mb-4 text-xs text-slate-500">
-            <p className="font-semibold text-slate-400 mb-2">Troubleshooting:</p>
-            <ul className="list-disc list-inside space-y-1">
-              <li>Ensure <code className="text-cyan-400">FRED_API_KEY</code> is set in environment</li>
-              <li>Get a free key at <a href="https://fred.stlouisfed.org/docs/api/api_key.html" className="text-cyan-400 hover:underline" target="_blank" rel="noopener noreferrer">fred.stlouisfed.org</a></li>
-              <li>Check network connectivity to api.stlouisfed.org</li>
-            </ul>
-          </div>
-          
-          <button 
-            onClick={loadData}
-            className="w-full py-2 bg-rose-900/50 hover:bg-rose-800/50 border border-rose-700 rounded-lg text-rose-300 font-mono text-sm transition-colors"
-          >
+          <button onClick={loadData} className="w-full py-2 bg-rose-900/50 hover:bg-rose-800/50 border border-rose-700 rounded-lg text-rose-300 font-mono text-sm transition-colors">
             Retry
           </button>
         </div>
@@ -170,7 +180,7 @@ const FLRTrackerLive = () => {
     );
   }
 
-  const { latest, timeSeries, csd, lppl, dateRange } = data;
+  const { latest, csd, lppl, dateRange } = data;
   const regimeColors = regime ? getRegimeColors(regime.color) : null;
 
   const metricCards = [
@@ -181,6 +191,27 @@ const FLRTrackerLive = () => {
     { label: 'S&P 500', value: latest.spx?.toLocaleString() || 'N/A', icon: TrendingUp, colorClass: 'text-amber-400' },
     { label: 'Sunspots', value: latest.sunspots?.toString() || 'N/A', icon: Sun, colorClass: 'text-orange-400' },
   ];
+
+  // Chart X-axis formatter based on time range
+  const formatXAxis = (dateStr) => {
+    if (!dateStr) return '';
+    if (timeRange === '1M' || timeRange === '3M') {
+      return dateStr.slice(5); // MM-DD
+    } else if (timeRange === '6M' || timeRange === '1Y') {
+      return dateStr.slice(2, 7); // YY-MM
+    } else {
+      return dateStr.slice(0, 7); // YYYY-MM
+    }
+  };
+
+  // Calculate tick interval based on data length
+  const getTickInterval = () => {
+    const len = filteredData.length;
+    if (len < 60) return Math.floor(len / 6);
+    if (len < 200) return Math.floor(len / 8);
+    if (len < 500) return Math.floor(len / 10);
+    return Math.floor(len / 12);
+  };
 
   return (
     <div className="min-h-screen bg-black text-white">
@@ -203,42 +234,21 @@ const FLRTrackerLive = () => {
             </div>
             <div>
               <h1 className="text-base sm:text-lg font-semibold tracking-tight">Fractal Liquidity Regime Tracker</h1>
-              <p className="text-xs text-slate-500 font-mono">Live Data • {dateRange?.start} to {dateRange?.end}</p>
+              <p className="text-xs text-slate-500 font-mono">{dateRange?.start} to {dateRange?.end} • {data.recordCount} days</p>
             </div>
           </div>
           
           <div className="flex items-center gap-2 sm:gap-3 w-full sm:w-auto justify-end flex-wrap">
-            {lastUpdated && (
-              <span className="text-xs text-slate-600 font-mono hidden sm:block">
-                Updated {lastUpdated.toLocaleTimeString()}
-              </span>
-            )}
-            <button
-              onClick={() => setShowSources(true)}
-              className="p-2 rounded-lg bg-emerald-900/30 hover:bg-emerald-800/30 border border-emerald-700 transition-colors"
-              title="Data Sources"
-            >
+            <button onClick={() => setShowSources(true)} className="p-2 rounded-lg bg-emerald-900/30 hover:bg-emerald-800/30 border border-emerald-700 transition-colors" title="Data Sources">
               <CheckCircle2 className="w-4 h-4 text-emerald-400" />
             </button>
-            <button
-              onClick={() => setShowSettings(true)}
-              className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors"
-              title="Settings"
-            >
+            <button onClick={() => setShowSettings(true)} className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors" title="Settings">
               <Sliders className="w-4 h-4 text-slate-400" />
             </button>
-            <button
-              onClick={() => setShowHelp(true)}
-              className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors"
-              title="Help"
-            >
+            <button onClick={() => setShowHelp(true)} className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors" title="Help">
               <HelpCircle className="w-4 h-4 text-slate-400" />
             </button>
-            <button
-              onClick={loadData}
-              className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors"
-              title="Refresh"
-            >
+            <button onClick={loadData} className="p-2 rounded-lg bg-slate-800/50 hover:bg-slate-700/50 border border-slate-700 transition-colors" title="Refresh">
               <RefreshCw className="w-4 h-4 text-slate-400" />
             </button>
             <div className="flex items-center gap-2 px-2 sm:px-3 py-1.5 rounded-full bg-emerald-950/50 border border-emerald-800">
@@ -307,6 +317,15 @@ const FLRTrackerLive = () => {
           ))}
         </div>
 
+        {/* TIME RANGE SELECTOR */}
+        <div className="flex items-center justify-between mb-4">
+          <div className="flex items-center gap-2">
+            <ZoomIn className="w-4 h-4 text-slate-500" />
+            <span className="text-xs text-slate-500 font-mono">Time Range:</span>
+          </div>
+          <TimeRangeSelector />
+        </div>
+
         {/* Charts Grid */}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4 sm:gap-6 mb-4 sm:mb-6">
           {/* Price & Trend */}
@@ -314,13 +333,14 @@ const FLRTrackerLive = () => {
             <h3 className="text-xs sm:text-sm font-mono text-cyan-400 mb-3 sm:mb-4">S&P 500 • Price & Gaussian Trend</h3>
             <div className="h-48 sm:h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={timeSeries.slice(-252)} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+                <ComposedChart data={filteredData} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={(val) => val?.slice(5, 7)} interval={40} />
+                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={formatXAxis} interval={getTickInterval()} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 9 }} domain={['auto', 'auto']} tickFormatter={(val) => (val/1000).toFixed(1) + 'k'} width={35} />
                   <Tooltip content={<CustomTooltip />} />
                   <Area type="monotone" dataKey="spx" fill="url(#priceGradient)" stroke="#06b6d4" strokeWidth={1.5} name="S&P 500" />
                   <Line type="monotone" dataKey="trend" stroke="#f59e0b" strokeWidth={2} strokeDasharray="5 5" dot={false} name="Trend" />
+                  <Brush dataKey="date" height={20} stroke="#334155" fill="#1e293b" tickFormatter={formatXAxis} />
                   <defs>
                     <linearGradient id="priceGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#06b6d4" stopOpacity={0.3} />
@@ -337,14 +357,15 @@ const FLRTrackerLive = () => {
             <h3 className="text-xs sm:text-sm font-mono text-cyan-400 mb-3 sm:mb-4">Critical Slowing Down • AR(1)</h3>
             <div className="h-48 sm:h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={timeSeries.slice(-252)} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+                <ComposedChart data={filteredData} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={(val) => val?.slice(5, 7)} interval={40} />
+                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={formatXAxis} interval={getTickInterval()} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 9 }} domain={[0, 1]} ticks={[0, 0.3, 0.5, 0.7, 1]} width={25} />
                   <Tooltip content={<CustomTooltip />} />
                   <ReferenceArea y1={0.7} y2={1} fill="#f43f5e" fillOpacity={0.1} />
                   <ReferenceLine y={0.7} stroke="#f43f5e" strokeDasharray="3 3" />
                   <Area type="monotone" dataKey="ar1" fill="url(#ar1Gradient)" stroke="#10b981" strokeWidth={1.5} name="AR(1)" connectNulls />
+                  <Brush dataKey="date" height={20} stroke="#334155" fill="#1e293b" tickFormatter={formatXAxis} />
                   <defs>
                     <linearGradient id="ar1Gradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#10b981" stopOpacity={0.3} />
@@ -361,19 +382,20 @@ const FLRTrackerLive = () => {
             <h3 className="text-xs sm:text-sm font-mono text-cyan-400 mb-3 sm:mb-4">Net Liquidity • (BS - TGA - RRP)</h3>
             <div className="h-48 sm:h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={timeSeries.slice(-252)} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+                <ComposedChart data={filteredData} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={(val) => val?.slice(5, 7)} interval={40} />
+                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={formatXAxis} interval={getTickInterval()} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 9 }} domain={['auto', 'auto']} tickFormatter={(val) => `${(val/1000).toFixed(1)}T`} width={35} />
                   <Tooltip content={<CustomTooltip />} />
                   <Area type="monotone" dataKey="netLiquidity" fill="url(#liquidityGradient)" stroke="#8b5cf6" strokeWidth={1.5} name="Net Liquidity ($B)" />
+                  <Brush dataKey="date" height={20} stroke="#334155" fill="#1e293b" tickFormatter={formatXAxis} />
                   <defs>
                     <linearGradient id="liquidityGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#8b5cf6" stopOpacity={0.3} />
                       <stop offset="100%" stopColor="#8b5cf6" stopOpacity={0} />
                     </linearGradient>
                   </defs>
-                </AreaChart>
+                </ComposedChart>
               </ResponsiveContainer>
             </div>
           </div>
@@ -383,19 +405,20 @@ const FLRTrackerLive = () => {
             <h3 className="text-xs sm:text-sm font-mono text-cyan-400 mb-3 sm:mb-4">Rolling Variance • Residual Vol</h3>
             <div className="h-48 sm:h-64">
               <ResponsiveContainer width="100%" height="100%">
-                <AreaChart data={timeSeries.slice(-252)} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
+                <ComposedChart data={filteredData} margin={{ top: 5, right: 5, bottom: 5, left: 0 }}>
                   <CartesianGrid strokeDasharray="3 3" stroke="#334155" opacity={0.3} />
-                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={(val) => val?.slice(5, 7)} interval={40} />
+                  <XAxis dataKey="date" tick={{ fill: '#64748b', fontSize: 9 }} tickFormatter={formatXAxis} interval={getTickInterval()} />
                   <YAxis tick={{ fill: '#64748b', fontSize: 9 }} domain={['auto', 'auto']} width={35} />
                   <Tooltip content={<CustomTooltip />} />
                   <Area type="monotone" dataKey="variance" fill="url(#varianceGradient)" stroke="#f59e0b" strokeWidth={1.5} name="Variance" connectNulls />
+                  <Brush dataKey="date" height={20} stroke="#334155" fill="#1e293b" tickFormatter={formatXAxis} />
                   <defs>
                     <linearGradient id="varianceGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="0%" stopColor="#f59e0b" stopOpacity={0.3} />
                       <stop offset="100%" stopColor="#f59e0b" stopOpacity={0} />
                     </linearGradient>
                   </defs>
-                </AreaChart>
+                </ComposedChart>
               </ResponsiveContainer>
             </div>
           </div>
@@ -433,8 +456,8 @@ const FLRTrackerLive = () => {
 
         {/* Footer */}
         <footer className="text-center text-xs text-slate-600 font-mono space-y-1">
-          <p>FLR Tracker v2.2 • Live Data from FRED, Treasury, NOAA • Not Financial Advice</p>
-          <p>{data.recordCount} data points • Click <CheckCircle2 className="inline w-3 h-3 text-emerald-400" /> to verify sources</p>
+          <p>FLR Tracker v2.3 • Live Data from FRED & NOAA • Not Financial Advice</p>
+          <p>{data.recordCount} data points • {dateRange?.start} to {dateRange?.end}</p>
         </footer>
       </div>
 
@@ -447,6 +470,10 @@ const FLRTrackerLive = () => {
               <button onClick={() => setShowHelp(false)} className="p-1 hover:bg-slate-800 rounded"><X className="w-5 h-5" /></button>
             </div>
             <div className="space-y-4 text-sm text-slate-300">
+              <div>
+                <h3 className="font-semibold text-cyan-400 mb-1">Time Controls</h3>
+                <p>Use the buttons (1M, 3M, 6M, 1Y, 2Y, 5Y, ALL) to change the view range. Drag the brush bar below each chart to zoom into specific periods.</p>
+              </div>
               <div>
                 <h3 className="font-semibold text-cyan-400 mb-1">AR(1) Coefficient</h3>
                 <p>Autocorrelation of price residuals. Values →1.0 indicate "critical slowing down".</p>
@@ -510,64 +537,44 @@ const FLRTrackerLive = () => {
               <button onClick={() => setShowSources(false)} className="p-1 hover:bg-slate-800 rounded"><X className="w-5 h-5" /></button>
             </div>
             
-            <p className="text-sm text-slate-400 mb-4">All data comes from official U.S. government sources. Click any link to verify.</p>
+            <p className="text-sm text-slate-400 mb-4">All data from official U.S. government sources. 10 years of history (2015-present).</p>
             
-            <div className="space-y-4">
+            <div className="space-y-3">
               {sources.liquidity && Object.entries(sources.liquidity).map(([key, source]) => (
-                <div key={key} className="p-3 bg-slate-800/50 rounded-lg">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="font-medium text-white text-sm">{source.name}</p>
-                      <p className="text-xs text-slate-500 mt-1">Frequency: {source.frequency} • Last: {source.lastUpdate}</p>
-                    </div>
-                    <a href={source.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
+                <div key={key} className="p-3 bg-slate-800/50 rounded-lg flex items-center justify-between">
+                  <div>
+                    <p className="font-medium text-white text-sm">{source.name}</p>
+                    <p className="text-xs text-slate-500">{source.frequency}</p>
                   </div>
-                  <code className="text-xs text-slate-600 mt-2 block break-all">{source.url}</code>
+                  <a href={source.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
+                    <ExternalLink className="w-4 h-4" />
+                  </a>
                 </div>
               ))}
               
               {sources.market && (
-                <div className="p-3 bg-slate-800/50 rounded-lg">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="font-medium text-white text-sm">{sources.market.name}</p>
-                      <p className="text-xs text-slate-500 mt-1">Provider: {sources.market.provider}</p>
-                      <p className="text-xs text-slate-500">Frequency: {sources.market.frequency} • Last: {sources.market.lastUpdate}</p>
-                    </div>
-                    <a href={sources.market.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
+                <div className="p-3 bg-slate-800/50 rounded-lg flex items-center justify-between">
+                  <div>
+                    <p className="font-medium text-white text-sm">{sources.market.name}</p>
+                    <p className="text-xs text-slate-500">{sources.market.frequency}</p>
                   </div>
-                  <code className="text-xs text-slate-600 mt-2 block break-all">{sources.market.url}</code>
+                  <a href={sources.market.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
+                    <ExternalLink className="w-4 h-4" />
+                  </a>
                 </div>
               )}
               
               {sources.solar && (
-                <div className="p-3 bg-slate-800/50 rounded-lg">
-                  <div className="flex items-start justify-between">
-                    <div>
-                      <p className="font-medium text-white text-sm">{sources.solar.name}</p>
-                      <p className="text-xs text-slate-500 mt-1">Frequency: {sources.solar.frequency} • Last: {sources.solar.lastUpdate}</p>
-                    </div>
-                    <a href={sources.solar.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
-                      <ExternalLink className="w-4 h-4" />
-                    </a>
+                <div className="p-3 bg-slate-800/50 rounded-lg flex items-center justify-between">
+                  <div>
+                    <p className="font-medium text-white text-sm">{sources.solar.name}</p>
+                    <p className="text-xs text-slate-500">{sources.solar.frequency}</p>
                   </div>
-                  <code className="text-xs text-slate-600 mt-2 block break-all">{sources.solar.dataUrl}</code>
+                  <a href={sources.solar.url} target="_blank" rel="noopener noreferrer" className="p-1.5 bg-cyan-900/30 hover:bg-cyan-800/30 rounded text-cyan-400">
+                    <ExternalLink className="w-4 h-4" />
+                  </a>
                 </div>
               )}
-            </div>
-            
-            <div className="mt-6 p-3 bg-emerald-950/30 border border-emerald-800 rounded-lg">
-              <div className="flex items-start gap-2">
-                <CheckCircle2 className="w-4 h-4 text-emerald-400 mt-0.5" />
-                <div className="text-xs text-emerald-300">
-                  <p className="font-medium">Audit Trail</p>
-                  <p className="text-emerald-400/70 mt-1">Every data point can be independently verified by querying the source APIs directly. No data is simulated or estimated.</p>
-                </div>
-              </div>
             </div>
           </div>
         </div>
