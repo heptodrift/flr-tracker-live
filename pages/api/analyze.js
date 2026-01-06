@@ -1,7 +1,7 @@
 /**
  * API Route: /api/analyze
  * Fetches all data and runs CSD/LPPL analysis
- * Calls external APIs directly (not internal routes)
+ * NOW WITH 10 YEARS OF HISTORY
  */
 
 // ============ STATISTICAL ENGINE ============
@@ -107,14 +107,18 @@ class LPPLModel {
     const n = prices.length;
     if (n < 100) return { isBubble: false, confidence: 0, r2: 0 };
     
-    const logPrices = prices.map(p => Math.log(p));
-    const t = Array.from({ length: n }, (_, i) => i);
+    // Only use last 500 days for LPPL (bubble detection is recent)
+    const recentPrices = prices.slice(-500);
+    const rn = recentPrices.length;
+    
+    const logPrices = recentPrices.map(p => Math.log(p));
+    const t = Array.from({ length: rn }, (_, i) => i);
     
     let bestFit = null;
     let bestR2 = -Infinity;
     
     const tcRange = [];
-    for (let tc = n + 5; tc <= n + 200; tc += 15) tcRange.push(tc);
+    for (let tc = rn + 5; tc <= rn + 200; tc += 15) tcRange.push(tc);
     
     for (const tc of tcRange) {
       for (const m of [0.2, 0.33, 0.5, 0.67, 0.8]) {
@@ -123,7 +127,7 @@ class LPPLModel {
             const X = [], y = [];
             let valid = true;
             
-            for (let i = 0; i < n; i++) {
+            for (let i = 0; i < rn; i++) {
               const dt = tc - t[i];
               if (dt <= 0) { valid = false; break; }
               const dtm = Math.pow(dt, m);
@@ -140,7 +144,7 @@ class LPPLModel {
             
             const predicted = t.map(ti => this.lpplFunction(ti, tc, A, B, C, m, omega, phi));
             const ssRes = logPrices.reduce((sum, yi, i) => sum + Math.pow(yi - predicted[i], 2), 0);
-            const meanY = logPrices.reduce((a, b) => a + b, 0) / n;
+            const meanY = logPrices.reduce((a, b) => a + b, 0) / rn;
             const ssTot = logPrices.reduce((sum, yi) => sum + Math.pow(yi - meanY, 2), 0);
             const r2 = ssTot > 0 ? 1 - ssRes / ssTot : 0;
             
@@ -158,7 +162,7 @@ class LPPLModel {
     }
     
     const confidence = Math.min(1, Math.max(0, (bestFit.r2 - 0.75) / 0.2));
-    const tcDays = Math.round(bestFit.tc - n + 1);
+    const tcDays = Math.round(bestFit.tc - rn + 1);
     
     return {
       ...bestFit,
@@ -216,7 +220,8 @@ export default async function handler(req, res) {
 
   try {
     const endDate = new Date().toISOString().split('T')[0];
-    const startDate = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+    // GO BACK 10 YEARS (TGA data starts 2015)
+    const startDate = '2015-01-01';
 
     // Fetch ALL data directly from external APIs
     const [walclRes, rrpRes, wresbalRes, wtregenRes, sp500Res, solarRes] = await Promise.all([
@@ -252,10 +257,19 @@ export default async function handler(req, res) {
     const tgaMap = toMap(wtregen.observations, 1000);
     const spxMap = toMap(sp500.observations, 1);
 
+    // FIXED: Better solar data parsing - handle both date formats
     const solarMap = {};
     (solar || []).forEach(s => {
-      if (s['time-tag'] && s.ssn != null) {
-        solarMap[s['time-tag'].split('T')[0]] = Math.round(s.ssn);
+      if (s.ssn != null) {
+        // NOAA uses "time-tag" field with format "YYYY-MM-01"
+        let dateStr = s['time-tag'];
+        if (dateStr) {
+          // Normalize to YYYY-MM-DD
+          dateStr = dateStr.split('T')[0];
+          // Store for the whole month
+          const yearMonth = dateStr.substring(0, 7); // "YYYY-MM"
+          solarMap[yearMonth] = Math.round(s.ssn);
+        }
       }
     });
 
@@ -277,17 +291,23 @@ export default async function handler(req, res) {
 
     // Build unified time series
     const timeSeries = allDates
-      .filter(d => fBS[d] && fTGA[d] && fRRP[d] && spxMap[d])
-      .map(d => ({
-        date: d,
-        balanceSheet: Math.round(fBS[d] * 10) / 10,
-        tga: Math.round(fTGA[d] * 10) / 10,
-        rrp: Math.round(fRRP[d] * 10) / 10,
-        reserves: fRes[d] ? Math.round(fRes[d] * 10) / 10 : null,
-        netLiquidity: Math.round((fBS[d] - fTGA[d] - fRRP[d]) * 10) / 10,
-        spx: Math.round(spxMap[d] * 100) / 100,
-        sunspots: solarMap[d] || null
-      }));
+      .filter(d => fBS[d] && fTGA[d] && fRRP[d] !== undefined && spxMap[d])
+      .map(d => {
+        // Get sunspot by matching year-month
+        const yearMonth = d.substring(0, 7);
+        const sunspots = solarMap[yearMonth] || null;
+        
+        return {
+          date: d,
+          balanceSheet: Math.round(fBS[d] * 10) / 10,
+          tga: Math.round(fTGA[d] * 10) / 10,
+          rrp: Math.round(fRRP[d] * 10) / 10,
+          reserves: fRes[d] ? Math.round(fRes[d] * 10) / 10 : null,
+          netLiquidity: Math.round((fBS[d] - fTGA[d] - fRRP[d]) * 10) / 10,
+          spx: Math.round(spxMap[d] * 100) / 100,
+          sunspots
+        };
+      });
 
     if (timeSeries.length < 100) {
       return res.status(400).json({ error: 'Insufficient data', count: timeSeries.length });
@@ -331,7 +351,7 @@ export default async function handler(req, res) {
           reserves: { name: 'WRESBAL', url: 'https://fred.stlouisfed.org/series/WRESBAL', frequency: 'Weekly' }
         },
         market: { name: 'SP500', url: 'https://fred.stlouisfed.org/series/SP500', frequency: 'Daily' },
-        solar: { name: 'NOAA SWPC', url: 'https://www.swpc.noaa.gov/products/solar-cycle-progression', frequency: 'Daily' }
+        solar: { name: 'NOAA SWPC', url: 'https://www.swpc.noaa.gov/products/solar-cycle-progression', frequency: 'Monthly' }
       },
       csd: {
         currentAR1: Math.round(currentAR1 * 1000) / 1000,
