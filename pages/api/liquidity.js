@@ -1,40 +1,163 @@
 /**
  * API Route: /api/liquidity
- * 
- * Fetches REAL Federal Reserve liquidity data from official sources.
- * All data is verifiable at the source URLs provided.
- * 
- * DATA SOURCES:
- * ─────────────────────────────────────────────────────────────────
- * 1. Fed Balance Sheet (Total Assets)
- *    Source: Federal Reserve Bank of St. Louis (FRED)
- *    Series: WALCL (Assets: Total Assets: Total Assets)
- *    URL: https://fred.stlouisfed.org/series/WALCL
- *    Frequency: Weekly (Wednesday)
- *    Units: Millions of Dollars
- * 
- * 2. Treasury General Account (TGA)
- *    Source: U.S. Department of Treasury - Fiscal Data
- *    Endpoint: Daily Treasury Statement - Table 1
- *    URL: https://fiscaldata.treasury.gov/datasets/daily-treasury-statement/
- *    Frequency: Daily (business days)
- *    Units: Millions of Dollars
- * 
- * 3. Reverse Repo (ON RRP)
- *    Source: Federal Reserve Bank of St. Louis (FRED)
- *    Series: RRPONTSYD (Overnight Reverse Repurchase Agreements)
- *    URL: https://fred.stlouisfed.org/series/RRPONTSYD
- *    Frequency: Daily
- *    Units: Billions of Dollars
- * 
- * 4. Bank Reserves
- *    Source: Federal Reserve Bank of St. Louis (FRED)  
- *    Series: WRESBAL (Reserve Balances with Federal Reserve Banks)
- *    URL: https://fred.stlouisfed.org/series/WRESBAL
- *    Frequency: Weekly (Wednesday)
- *    Units: Millions of Dollars
- * ─────────────────────────────────────────────────────────────────
+ * Fetches Fed liquidity data from FRED and Treasury
  */
+
+let cache = { data: null, timestamp: 0 };
+const CACHE_TTL = 5 * 60 * 1000;
+
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET');
+
+  if (cache.data && Date.now() - cache.timestamp < CACHE_TTL) {
+    return res.status(200).json({ ...cache.data, cached: true });
+  }
+
+  const FRED_API_KEY = process.env.FRED_API_KEY;
+
+  if (!FRED_API_KEY) {
+    return res.status(500).json({
+      error: 'FRED_API_KEY not configured',
+      message: 'Please set FRED_API_KEY environment variable'
+    });
+  }
+
+  try {
+    const endDate = new Date().toISOString().split('T')[0];
+    const startDate = new Date(Date.now() - 730 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
+
+    // Fetch from FRED (these work)
+    const [balanceSheetRes, rrpRes, reservesRes] = await Promise.all([
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WALCL&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=RRPONTSYD&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`),
+      fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WRESBAL&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`)
+    ]);
+
+    // Also try to get TGA from FRED (series WTREGEN)
+    const tgaRes = await fetch(`https://api.stlouisfed.org/fred/series/observations?series_id=WTREGEN&api_key=${FRED_API_KEY}&file_type=json&observation_start=${startDate}&observation_end=${endDate}`);
+
+    const [balanceSheetData, rrpData, reservesData, tgaData] = await Promise.all([
+      balanceSheetRes.json(),
+      rrpRes.json(),
+      reservesRes.json(),
+      tgaRes.json()
+    ]);
+
+    if (balanceSheetData.error_message) {
+      throw new Error(`FRED API Error: ${balanceSheetData.error_message}`);
+    }
+
+    // Process into lookup maps
+    const balanceSheetMap = {};
+    (balanceSheetData.observations || []).forEach(obs => {
+      if (obs.value !== '.') {
+        balanceSheetMap[obs.date] = parseFloat(obs.value) / 1000; // to Billions
+      }
+    });
+
+    const rrpMap = {};
+    (rrpData.observations || []).forEach(obs => {
+      if (obs.value !== '.') {
+        rrpMap[obs.date] = parseFloat(obs.value); // Already Billions
+      }
+    });
+
+    const reservesMap = {};
+    (reservesData.observations || []).forEach(obs => {
+      if (obs.value !== '.') {
+        reservesMap[obs.date] = parseFloat(obs.value) / 1000; // to Billions
+      }
+    });
+
+    const tgaMap = {};
+    (tgaData.observations || []).forEach(obs => {
+      if (obs.value !== '.') {
+        tgaMap[obs.date] = parseFloat(obs.value) / 1000; // to Billions
+      }
+    });
+
+    // Get all dates from RRP (daily)
+    const allDates = Object.keys(rrpMap).sort();
+
+    // Forward-fill weekly data
+    const forwardFill = (map, dates) => {
+      const filled = {};
+      let lastValue = null;
+      dates.forEach(date => {
+        if (map[date] !== undefined) lastValue = map[date];
+        if (lastValue !== null) filled[date] = lastValue;
+      });
+      return filled;
+    };
+
+    const filledBS = forwardFill(balanceSheetMap, allDates);
+    const filledTGA = forwardFill(tgaMap, allDates);
+    const filledReserves = forwardFill(reservesMap, allDates);
+
+    // Build time series
+    const timeSeries = allDates
+      .filter(date => filledBS[date] && filledTGA[date] && rrpMap[date] !== undefined)
+      .map(date => {
+        const bs = filledBS[date];
+        const tga = filledTGA[date];
+        const rrp = rrpMap[date];
+        const reserves = filledReserves[date];
+        const netLiquidity = bs - tga - rrp;
+
+        return {
+          date,
+          balanceSheet: Math.round(bs * 10) / 10,
+          tga: Math.round(tga * 10) / 10,
+          rrp: Math.round(rrp * 10) / 10,
+          reserves: reserves ? Math.round(reserves * 10) / 10 : null,
+          netLiquidity: Math.round(netLiquidity * 10) / 10
+        };
+      });
+
+    const latest = timeSeries[timeSeries.length - 1];
+
+    const result = {
+      success: true,
+      timestamp: new Date().toISOString(),
+      sources: {
+        balanceSheet: {
+          name: 'Fed Total Assets (WALCL)',
+          url: 'https://fred.stlouisfed.org/series/WALCL',
+          frequency: 'Weekly'
+        },
+        tga: {
+          name: 'Treasury General Account (WTREGEN)',
+          url: 'https://fred.stlouisfed.org/series/WTREGEN',
+          frequency: 'Weekly'
+        },
+        rrp: {
+          name: 'Overnight Reverse Repo (RRPONTSYD)',
+          url: 'https://fred.stlouisfed.org/series/RRPONTSYD',
+          frequency: 'Daily'
+        },
+        reserves: {
+          name: 'Reserve Balances (WRESBAL)',
+          url: 'https://fred.stlouisfed.org/series/WRESBAL',
+          frequency: 'Weekly'
+        }
+      },
+      latest,
+      timeSeries,
+      recordCount: timeSeries.length
+    };
+
+    cache = { data: result, timestamp: Date.now() };
+    return res.status(200).json(result);
+
+  } catch (error) {
+    console.error('Liquidity API Error:', error);
+    return res.status(500).json({
+      error: 'Failed to fetch liquidity data',
+      message: error.message
+    });
+  }
+} */
 
 // In-memory cache to respect API rate limits
 let cache = {
